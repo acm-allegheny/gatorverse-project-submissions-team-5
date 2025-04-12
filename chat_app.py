@@ -2,6 +2,7 @@ from __future__ import annotations as _annotations
 
 import asyncio
 import json
+import os  # ✅ Added to access env vars
 import sqlite3
 from collections.abc import AsyncIterator
 from concurrent.futures.thread import ThreadPoolExecutor
@@ -14,9 +15,13 @@ from typing import Annotated, Any, Callable, Literal, TypeVar
 
 import fastapi
 import logfire
+from dotenv import load_dotenv  # ✅ Added to load .env
 from fastapi import Depends, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from typing_extensions import LiteralString, ParamSpec, TypedDict
+
+# ✅ Load .env before initializing the agent
+load_dotenv()
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
@@ -29,37 +34,32 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-# 'if-token-present' means nothing will be sent (and the example will work) if you don't have logfire configured
-logfire.configure(send_to_logfire='if-token-present')
+# Optional: check if the key is set (for debugging, can be removed)
+# print("Loaded OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
 
-agent = Agent('openai:gpt-4o', instrument=True)
+# ✅ Now that .env is loaded, the agent can use the API key
+agent = Agent('openai:gpt-3.5-turbo', instrument=True)
+
 THIS_DIR = Path(__file__).parent
-
 
 @asynccontextmanager
 async def lifespan(_app: fastapi.FastAPI):
     async with Database.connect() as db:
         yield {'db': db}
 
-
 app = fastapi.FastAPI(lifespan=lifespan)
 logfire.instrument_fastapi(app)
-
 
 @app.get('/')
 async def index() -> FileResponse:
     return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
 
-
 @app.get('/chat_app.ts')
 async def main_ts() -> FileResponse:
-    """Get the raw typescript code, it's compiled in the browser, forgive me."""
     return FileResponse((THIS_DIR / 'chat_app.ts'), media_type='text/plain')
-
 
 async def get_db(request: Request) -> Database:
     return request.state.db
-
 
 @app.get('/chat/')
 async def get_chat(database: Database = Depends(get_db)) -> Response:
@@ -69,14 +69,10 @@ async def get_chat(database: Database = Depends(get_db)) -> Response:
         media_type='text/plain',
     )
 
-
 class ChatMessage(TypedDict):
-    """Format of messages sent to the browser."""
-
     role: Literal['user', 'model']
     timestamp: str
     content: str
-
 
 def to_chat_message(m: ModelMessage) -> ChatMessage:
     first_part = m.parts[0]
@@ -97,14 +93,11 @@ def to_chat_message(m: ModelMessage) -> ChatMessage:
             }
     raise UnexpectedModelBehavior(f'Unexpected message type for chat app: {m}')
 
-
 @app.post('/chat/')
 async def post_chat(
     prompt: Annotated[str, fastapi.Form()], database: Database = Depends(get_db)
 ) -> StreamingResponse:
     async def stream_messages():
-        """Streams new line delimited JSON `Message`s to the client."""
-        # stream the user prompt so that can be displayed straight away
         yield (
             json.dumps(
                 {
@@ -115,34 +108,21 @@ async def post_chat(
             ).encode('utf-8')
             + b'\n'
         )
-        # get the chat history so far to pass as context to the agent
         messages = await database.get_messages()
-        # run the agent with the user prompt and the chat history
         async with agent.run_stream(prompt, message_history=messages) as result:
             async for text in result.stream(debounce_by=0.01):
-                # text here is a `str` and the frontend wants
-                # JSON encoded ModelResponse, so we create one
                 m = ModelResponse(parts=[TextPart(text)], timestamp=result.timestamp())
                 yield json.dumps(to_chat_message(m)).encode('utf-8') + b'\n'
 
-        # add new messages (e.g. the user prompt and the agent response in this case) to the database
         await database.add_messages(result.new_messages_json())
 
     return StreamingResponse(stream_messages(), media_type='text/plain')
 
-
 P = ParamSpec('P')
 R = TypeVar('R')
 
-
 @dataclass
 class Database:
-    """Rudimentary database to store chat messages in SQLite.
-
-    The SQLite standard library package is synchronous, so we
-    use a thread pool executor to run queries asynchronously.
-    """
-
     con: sqlite3.Connection
     _loop: asyncio.AbstractEventLoop
     _executor: ThreadPoolExecutor
@@ -204,12 +184,11 @@ class Database:
     async def _asyncify(
         self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
     ) -> R:
-        return await self._loop.run_in_executor(  # type: ignore
+        return await self._loop.run_in_executor(
             self._executor,
             partial(func, **kwargs),
-            *args,  # type: ignore
+            *args,
         )
-
 
 if __name__ == '__main__':
     import uvicorn
